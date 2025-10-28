@@ -1,0 +1,8 @@
+python sentinel1_downloader.py --configuration_file="config.json" --start_date="2024-10-15" --end_date="2025-10-17" --track P4
+
+
+1. conda install -c anaconda requests
+2. conda install -c conda-forge gdal
+3. conda install -c conda-forge rasterio
+4. conda install -c conda-forge geopandas
+5. conda install -c conda-forge xmltodict

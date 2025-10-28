@@ -1,0 +1,47 @@
+├─ 1_Sentinel-1_downloader                 # Download stage
+│   ├─ sentinel1_downloader.py             # Finds & downloads Sentinel-1 GRD
+│   ├─ config.json                         # {credentials, directories, gpt path}
+│   └─ regions\                            # AOI shapefiles (*.shp; EPSG:4326): p1.shp, etc. 
+│       ├─ p1.shp (Austria)		     (each defines the geographic extent of a specific region to process)
+│       ├─ p2.shp (Ireland)
+│       ├─ p3.shp (Netherlands)
+│       └─ p4.shp (Portugal or any other country or region)
+├─ 2_Sentinel-1_preprocessor               # Sentinel-1 preprocessing stage
+│   ├─ 1_AIML_S1_slice_calibration.py      # SNAP deburst & radiometric calibration → SNAP .dim/.data
+│   ├─ 2_AIML_S1_coregistration.py         # Align time-series, speckle filtering → SNAP .dim/.data
+│   └─ 3_AIML_S1_stack_clip.py             # Build multiband stacks, clip & mask → ENVI .hdr
+├─ auxiliary_files                         # Static inputs
+│   ├─ raster_files\
+│   │   └─ EU_arable_areas_mask_3857.tif   # Binary mask of arable land
+│   ├─ shapefiles_nuts\                    # NUTS2 boundaries
+│   │   ├─ AU\NUTS2_AU.shp
+│   │   ├─ IR\NUTS2_IR.shp
+│   │   ├─ NL\NUTS2_NL.shp
+│   │   └─ PT\NUTS2_PT.shp
+│   └─ shapefiles_samples\                # Training/validation samples
+│       ├─ AU_P1\samples.shp              # Includes fields: crop_id, crop_name
+│       ├─ IR_P2\samples.shp
+│       ├─ NL_P3\samples.shp
+│       └─ PT_P4\samples.shp
+├─ 3_OBIA_classifier                       # Classification stage
+│   ├─ OTB-6.2.0-Win64\                    # OTB CLI binaries
+│   ├─ 1_OBIA_vector_classifier.py         # OBIA + RF training + classification + metric
+│   └─ 2_OBIA_merge_classifications.py     # Mosaic if region has more than one track
+└─ workingDir                              # Generated outputs, one folder per track
+    ├─ P1\
+    │   ├─ zip\                             # Downloaded *.zip archives
+    │   ├─ processed_raster\                # GeoGrid .img/.hdr per burst
+    │   ├─ S1_final_preprocessing\          # SNAP .dim/.data stacks
+    │   └─ classification_results\          # Full OBIA & RF outputs
+    │       ├─ segmentation\                # .shp segments from OTB segmentation
+    │       ├─ samples\                     # learn.shp, control.shp, and <country>_<TR>_learn_selected.shp
+    │       ├─ train_model\                 # Random Forest model file: <country>_<TR>_model.rf
+    │       ├─ classification\              # Classification rasters & shapefiles
+    │       │   ├─ <COUNTRY>_<TR>_classified.shp      # Vector polygons with predicted classes and confidence
+    │       │   ├─ <COUNTRY>_<TR>_classified.tif      # Rasterized classification map (integer labels)
+    │       │   ├─ <COUNTRY>_<TR>_confidence_map.tif  # Pixel-wise confidence scores
+    │       │   ├─ <COUNTRY>_<TR>_classified_masked.tif    # Masked classification (arable+coverage)
+    │       │   └─ <COUNTRY>_<TR>_confidence_masked.tif    # Masked confidence map
+    │       └─ <country>_<TR>_metrics.xlsx     # Excel report with confusion matrix, OA, Kappa, per-class metrics, areas
+        ├─ <COUNTRY>_final_classification.tif  # Mosaic of multi-track classification based on highest confidence
+        └─ <COUNTRY>_final_metrics.xlsx        # Metrics Excel for the final classification across tracks
