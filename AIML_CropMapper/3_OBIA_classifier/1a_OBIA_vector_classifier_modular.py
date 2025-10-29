@@ -14,8 +14,8 @@ from openpyxl.styles import Font
 # --- Configuration (Global) ---
 
 # Configuration paths
-base_dir = Path("D:/AIML_CropMapper/workingDir")
-aux_dir = Path("D:/AIML_CropMapper/auxiliary_files")
+base_dir = Path("F:/AIML_CropMapper/workingDir")
+aux_dir = Path("F:/AIML_CropMapper/auxiliary_files")
 track_regions = {
     'P1': 'AU', 'P1a': 'AU',
     'P2': 'IR', 'P3': 'NL',
@@ -75,10 +75,11 @@ class ProcessingPipeline:
         self.stage2_params = {
             'learn_frac': 0.7, 'random_state': 42
         }
+        # --- UPDATED STAGE 4 PARAMS (ANN Removed) ---
         self.stage4_params = {
             'classifier': 'rf',
             'rf_max': 110, 'rf_min': 2, 'rf_var': 16, 'rf_cat': 16, 'rf_acc': 0.01,
-            'svm_c': 1.0, 'svm_k': 'linear' # Example for other classifiers
+            'svm_c': 1.0, 'svm_k': 'linear'
         }
         
         # --- 5. Shared state variables ---
@@ -217,14 +218,17 @@ class ProcessingPipeline:
                 print("Warning: CRS mismatch. Re-projecting segmentation to sample CRS.")
                 polys = polys.to_crs(pts.crs)
             
-            sel = gpd.sjoin(polys, pts, how='inner', predicate='intersects')
+            sel = gpd.sjoin(polys, pts, how='inner', op='intersects')
             sel.to_file(self.sel_shp)
             print(f"[Stage {stage}/{self.total_stages}] Selected {len(sel)} features\n")
         else:
             print(f"[Stage {stage}/{self.total_stages}] Selection exists, skipping\n")
 
-    # --- Stage 4: Train Classifier ---
+    # --- Stage 4: Train Classifier (ANN REMOVED) ---
     def stage_4_train_classifier(self, **kwargs):
+        # Pop 'force_retrain' from kwargs
+        force_retrain = kwargs.pop('force_retrain', False)
+        
         params = self.stage4_params.copy()
         params.update(kwargs)
         stage = 4
@@ -241,11 +245,20 @@ class ProcessingPipeline:
         clf_name = params['classifier']
         model_fn = self.model_dir / f"{self.country}_{self.track}_model.{clf_name}"
         
-        if not model_fn.exists() or os.path.getsize(model_fn) == 0:
-            if model_fn.exists(): print(f"[Stage {stage}/{self.total_stages}] Empty model, retrain\n")
+        confmat_fn = self.model_dir / f"{self.country}_{self.track}_train_confmat.{clf_name}.csv"
+
+        
+        # Check for forcing retrain or if model doesn't exist
+        if force_retrain or not model_fn.exists() or os.path.getsize(model_fn) == 0:
+            if force_retrain and model_fn.exists():
+                print(f"[Stage {stage}/{self.total_stages}] Parameters changed. Forcing overwrite of existing model.")
+            elif model_fn.exists() and os.path.getsize(model_fn) == 0: 
+                print(f"[Stage {stage}/{self.total_stages}] Empty model, retrain\n")
             
-            # Build classifier string
-            clf_str = f"-classifier {clf_name}"
+            # Use 'libsvm' for OTB, but keep 'svm' as the param name
+            otb_clf_name = 'libsvm' if clf_name == 'svm' else clf_name
+            clf_str = f"-classifier {otb_clf_name}"
+            
             if clf_name == 'rf':
                 clf_str += (
                     f" -classifier.rf.max {params['rf_max']} -classifier.rf.min {params['rf_min']} "
@@ -253,21 +266,55 @@ class ProcessingPipeline:
                     f" -classifier.rf.acc {params['rf_acc']}"
                 )
             elif clf_name == 'svm':
-                # Example for SVM
-                clf_str += f" -classifier.svm.c {params.get('svm_c', 1.0)}"
-                clf_str += f" -classifier.svm.k {params.get('svm_k', 'linear')}"
+                # Parameters are prefixed with 'libsvm'
+                clf_str += f" -classifier.libsvm.c {params.get('svm_c', 1.0)}"
+                clf_str += f" -classifier.libsvm.k {params.get('svm_k', 'linear')}"
                 print(f"Using SVM with params: {clf_str}")
-            # ... add elif for other otb classifiers as needed
             
             cmd = (
                 f"otbcli_TrainVectorClassifier -io.vd {self.sel_shp} -io.out {model_fn} "
-                f"-feat \"{self.feat_str}\" -cfield crop_id {clf_str}"
+                f"-feat {self.feat_str} -cfield crop_id {clf_str} "
+                f"-io.confmatout {confmat_fn}"
             )
             self._run_cmd(cmd, stage, f'Train {clf_name.upper()}')
+            
+            # --- Read and print the confusion matrix ---
+            try:
+                if confmat_fn.exists():
+                    print(f"\n--- Training Confusion Matrix ---")
+                    
+                    df_cm = pd.read_csv(confmat_fn, skiprows=2, index_col=0)
+                    
+                    # Clean up the dataframe (remove Total/PA/UA rows/cols)
+                    df_cm = df_cm.drop(index=['Total', 'UA'], columns=['Total', 'PA'], errors='ignore')
+                    df_cm = df_cm.dropna(how='all', axis=0).dropna(how='all', axis=1)
+                    df_cm = df_cm.fillna(0)
+                    
+                    print(df_cm.to_string())
+                    if not df_cm.empty:
+                        cm_values = df_cm.values
+                        total = np.sum(cm_values)
+                        correct = np.trace(cm_values)
+                        if total > 0:
+                            oa = correct / total
+                            print(f"\nTraining Overall Accuracy (from CM): {oa:.4f}")
+                        else:
+                            print("\nCould not calculate training accuracy: Matrix is empty.")
+                    print("---------------------------------\n")
+                else:
+                    print(f"Warning: Training confusion matrix file not found at {confmat_fn}\n")
+
+            except Exception as e:
+                print(f"Warning: Could not read or process training confusion matrix.")
+                print(f"Error: {e}\n")
+            # --- End new section ---
+
         else:
             print(f"[Stage {stage}/{self.total_stages}] Model exists, skipping\n")
+            if confmat_fn.exists():
+                print(f"(Training metrics available at {confmat_fn})")
     
-    # --- Stage 5: Classification ---
+    # --- Stage 5: Classification (FIXED) ---
     def stage_5_classify_vector(self):
         stage = 5
         
@@ -299,7 +346,8 @@ class ProcessingPipeline:
         if not self.class_shp.exists():
             cmd = (
                 f"otbcli_VectorClassifier -in {self.seg_shp} -out {self.class_shp} "
-                f"-model {model_file} -feat \"{self.feat_str}\" -cfield predicted -confmap true"
+                # --- FIX: Quotes removed from self.feat_str ---
+                f"-model {model_file} -feat {self.feat_str} -cfield predicted -confmap true"
             )
             self._run_cmd(cmd, stage, 'Vec class + conf')
         else:
@@ -516,8 +564,9 @@ def get_params(param_dict):
         print(f"  {key}: {val}")
     return new_params
 
+# --- REPLACED get_classifier_params (ANN Removed) ---
 def get_classifier_params(param_dict):
-    """Special helper for classifier params."""
+    """Special helper for classifier params (UPDATED with validation)."""
     new_params = param_dict.copy()
     print("--- Current Parameters ---")
     for key, val in new_params.items():
@@ -539,21 +588,47 @@ def get_classifier_params(param_dict):
     else:
         print(f"No specific parameters defined for '{clf}'. No parameters will be updated.")
         prefix = None
-        
+            
     if prefix:
         for key in [k for k in new_params if k.startswith(prefix)]:
             val = new_params[key]
-            new_val_str = input(f"Enter new value for '{key}' [{val}]: ")
-            if new_val_str:
-                try:
-                    new_params[key] = type(val)(new_val_str)
-                except ValueError:
-                    print(f"Invalid value. Keeping default {val}.")
+            
+            # --- VALIDATION LOGIC ---
+            while True: # Start a loop to force valid input
+                new_val_str = ""
+                
+                if key == 'svm_k':
+                    options = ['linear', 'rbf', 'poly', 'sigmoid']
+                    print(f"Options: {options}")
+                    new_val_str = input(f"Enter new value for '{key}' [{val}]: ")
+                    
+                    if not new_val_str: new_val_str = str(val) # Use default if empty
+                    
+                    if new_val_str in options:
+                        new_params[key] = new_val_str
+                        break # Valid input, exit loop
+                    else:
+                        print(f"ERROR: Invalid choice. Must be one of {options}.")
+                
+                else:
+                    # Default behavior for other params (like rf_max, svm_c)
+                    new_val_str = input(f"Enter new value for '{key}' [{val}]: ")
+                    if not new_val_str:
+                        break # Keep default, exit loop
+                    
+                    try:
+                        original_type = type(val)
+                        new_params[key] = original_type(new_val_str)
+                        break # Valid type, exit loop
+                    except ValueError:
+                        print(f"Invalid value. Must be of type {original_type.__name__}.")
+            # --- End new logic ---
 
     print("--- Updated Parameters ---")
     for key, val in new_params.items():
         print(f"  {key}: {val}")
     return new_params
+
 
 # --- Main Execution ---
 
@@ -602,11 +677,26 @@ def main_menu(pipeline):
                 print("\n--- STAGE 3: SELECTION ---")
                 pipeline.stage_3_selection()
             
+            # --- MODIFIED '4' BLOCK ---
             elif choice == '4':
                 print("\n--- STAGE 4: TRAIN CLASSIFIER ---")
-                new_params = get_classifier_params(pipeline.stage4_params)
+                
+                # Check if params were changed to force retraining
+                original_params = pipeline.stage4_params.copy()
+                new_params = get_classifier_params(original_params)
+                
+                force = (original_params != new_params)
+                if force:
+                    print("\nParameters changed, forcing model retrain.")
+                    
                 pipeline.stage4_params.update(new_params)
-                pipeline.stage_4_train_classifier(**pipeline.stage4_params)
+                
+                # Pass params and the 'force' flag to the function
+                call_params = pipeline.stage4_params.copy()
+                call_params['force_retrain'] = force
+                
+                pipeline.stage_4_train_classifier(**call_params)
+            # --- END MODIFIED BLOCK ---
             
             elif choice == '5':
                 print("\n--- STAGE 5: CLASSIFY VECTOR ---")
@@ -647,7 +737,8 @@ def main_menu(pipeline):
                 print("\n--- STAGE 3: SELECTION ---")
                 pipeline.stage_3_selection()
                 print("\n--- STAGE 4: TRAIN CLASSIFIER ---")
-                pipeline.stage_4_train_classifier(**pipeline.stage4_params)
+                # 'Run All' will default to force_retrain=False, which is correct
+                pipeline.stage_4_train_classifier(**pipeline.stage4_params) 
                 print("\n--- STAGE 5: CLASSIFY VECTOR ---")
                 pipeline.stage_5_classify_vector()
                 print("\n--- STAGE 6: RASTERIZE CLASS ---")
