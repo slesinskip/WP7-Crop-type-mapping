@@ -42,9 +42,8 @@ class ProcessingPipeline:
         self.seg_dir = self.out_dir / 'segmentation'
         self.class_dir = self.out_dir / 'classification'
         
-        # Create dirs
-        for d in [self.samples_dir, self.model_dir, self.seg_dir, self.class_dir]: 
-            d.mkdir(parents=True, exist_ok=True)
+        # --- FIX: Ensure directories exist immediately upon init ---
+        self._ensure_directories()
 
         # --- 2. Resolve input raster ---
         self.hdr = next(self.proc_dir.glob(f"*_{self.track}_*_VH_VV.hdr"), None)
@@ -75,7 +74,6 @@ class ProcessingPipeline:
         self.stage2_params = {
             'learn_frac': 0.7, 'random_state': 42
         }
-        # --- UPDATED STAGE 4 PARAMS (ANN Removed) ---
         self.stage4_params = {
             'classifier': 'rf',
             'rf_max': 110, 'rf_min': 2, 'rf_var': 16, 'rf_cat': 16, 'rf_acc': 0.01,
@@ -83,10 +81,15 @@ class ProcessingPipeline:
         }
         
         # --- 5. Shared state variables ---
-        self.feat_str = "" # Will be set in stage 4 and used in stage 5
+        self.feat_str = "" 
 
 
     # --- Utility Methods ---
+    
+    def _ensure_directories(self):
+        """Helper to enforce directory existence before writing files."""
+        for d in [self.samples_dir, self.model_dir, self.seg_dir, self.class_dir]: 
+            d.mkdir(parents=True, exist_ok=True)
 
     def _run_cmd(self, cmd, stage, desc):
         print(f"[Stage {stage}/{self.total_stages}] {desc}")
@@ -163,7 +166,7 @@ class ProcessingPipeline:
 
     # --- Stage 1: Segmentation ---
     def stage_1_segmentation(self, **kwargs):
-        # Use kwargs to update defaults
+        self._ensure_directories() # FIX: Ensure folder exists
         params = self.stage1_params.copy()
         params.update(kwargs)
         stage = 1
@@ -182,6 +185,7 @@ class ProcessingPipeline:
 
     # --- Stage 2: Sample Split ---
     def stage_2_split_samples(self, **kwargs):
+        self._ensure_directories() # FIX: Ensure folder exists
         params = self.stage2_params.copy()
         params.update(kwargs)
         stage = 2
@@ -191,7 +195,6 @@ class ProcessingPipeline:
             print(f"ERROR: Input sample file not found: {self.sample_shp}")
             return
             
-        self.samples_dir.mkdir(parents=True, exist_ok=True)
         gdf = gpd.read_file(str(self.sample_shp))
         learn = gdf.sample(frac=params['learn_frac'], random_state=params['random_state'])
         control = gdf.drop(learn.index)
@@ -202,6 +205,7 @@ class ProcessingPipeline:
 
     # --- Stage 3: Selection ---
     def stage_3_selection(self):
+        self._ensure_directories() # FIX: Ensure folder exists
         stage = 3
         if not self.sel_shp.exists():
             print(f"[Stage {stage}/{self.total_stages}] Running sample selection")
@@ -224,11 +228,11 @@ class ProcessingPipeline:
         else:
             print(f"[Stage {stage}/{self.total_stages}] Selection exists, skipping\n")
 
-    # --- Stage 4: Train Classifier (ANN REMOVED) ---
+    # --- Stage 4: Train Classifier ---
     def stage_4_train_classifier(self, **kwargs):
-        # Pop 'force_retrain' from kwargs
-        force_retrain = kwargs.pop('force_retrain', False)
+        self._ensure_directories() # FIX: Ensure folder exists (solves your train_model error)
         
+        force_retrain = kwargs.pop('force_retrain', False)
         params = self.stage4_params.copy()
         params.update(kwargs)
         stage = 4
@@ -239,23 +243,18 @@ class ProcessingPipeline:
 
         df_sel = gpd.read_file(self.sel_shp)
         feats = [c for c in df_sel.columns if c.startswith('meanB')]
-        self.feat_str = ' '.join(feats) # Store for stage 5
+        self.feat_str = ' '.join(feats) 
         
-        # Handle model name based on classifier
         clf_name = params['classifier']
         model_fn = self.model_dir / f"{self.country}_{self.track}_model.{clf_name}"
-        
         confmat_fn = self.model_dir / f"{self.country}_{self.track}_train_confmat.{clf_name}.csv"
-
         
-        # Check for forcing retrain or if model doesn't exist
         if force_retrain or not model_fn.exists() or os.path.getsize(model_fn) == 0:
             if force_retrain and model_fn.exists():
                 print(f"[Stage {stage}/{self.total_stages}] Parameters changed. Forcing overwrite of existing model.")
             elif model_fn.exists() and os.path.getsize(model_fn) == 0: 
                 print(f"[Stage {stage}/{self.total_stages}] Empty model, retrain\n")
             
-            # Use 'libsvm' for OTB, but keep 'svm' as the param name
             otb_clf_name = 'libsvm' if clf_name == 'svm' else clf_name
             clf_str = f"-classifier {otb_clf_name}"
             
@@ -266,10 +265,8 @@ class ProcessingPipeline:
                     f" -classifier.rf.acc {params['rf_acc']}"
                 )
             elif clf_name == 'svm':
-                # Parameters are prefixed with 'libsvm'
                 clf_str += f" -classifier.libsvm.c {params.get('svm_c', 1.0)}"
                 clf_str += f" -classifier.libsvm.k {params.get('svm_k', 'linear')}"
-                print(f"Using SVM with params: {clf_str}")
             
             cmd = (
                 f"otbcli_TrainVectorClassifier -io.vd {self.sel_shp} -io.out {model_fn} "
@@ -282,14 +279,10 @@ class ProcessingPipeline:
             try:
                 if confmat_fn.exists():
                     print(f"\n--- Training Confusion Matrix ---")
-                    
                     df_cm = pd.read_csv(confmat_fn, skiprows=2, index_col=0)
-                    
-                    # Clean up the dataframe (remove Total/PA/UA rows/cols)
                     df_cm = df_cm.drop(index=['Total', 'UA'], columns=['Total', 'PA'], errors='ignore')
                     df_cm = df_cm.dropna(how='all', axis=0).dropna(how='all', axis=1)
                     df_cm = df_cm.fillna(0)
-                    
                     print(df_cm.to_string())
                     if not df_cm.empty:
                         cm_values = df_cm.values
@@ -298,27 +291,23 @@ class ProcessingPipeline:
                         if total > 0:
                             oa = correct / total
                             print(f"\nTraining Overall Accuracy (from CM): {oa:.4f}")
-                        else:
-                            print("\nCould not calculate training accuracy: Matrix is empty.")
-                    print("---------------------------------\n")
                 else:
                     print(f"Warning: Training confusion matrix file not found at {confmat_fn}\n")
 
             except Exception as e:
                 print(f"Warning: Could not read or process training confusion matrix.")
                 print(f"Error: {e}\n")
-            # --- End new section ---
 
         else:
             print(f"[Stage {stage}/{self.total_stages}] Model exists, skipping\n")
             if confmat_fn.exists():
                 print(f"(Training metrics available at {confmat_fn})")
     
-    # --- Stage 5: Classification (FIXED) ---
+    # --- Stage 5: Classification ---
     def stage_5_classify_vector(self):
+        self._ensure_directories() # FIX: Ensure folder exists
         stage = 5
         
-        # Find the model file based on current params
         clf_name = self.stage4_params['classifier']
         model_file = self.model_dir / f"{self.country}_{self.track}_model.{clf_name}"
         if not model_file.exists():
@@ -328,7 +317,6 @@ class ProcessingPipeline:
              print(f"ERROR: Segmentation file {self.seg_shp} not found. Run Stage 1 first.")
              return
              
-        # Get feature string. Try to use from stage 4, otherwise regenerate.
         if not self.feat_str:
             print("Feature string not set. Trying to read from selected samples...")
             try:
@@ -337,8 +325,6 @@ class ProcessingPipeline:
                 df_sel = gpd.read_file(self.sel_shp)
                 feats = [c for c in df_sel.columns if c.startswith('meanB')]
                 self.feat_str = ' '.join(feats)
-                if not self.feat_str:
-                    raise ValueError("No 'meanB' features found in sel_shp")
             except Exception as e:
                 print(f"ERROR: Could not determine features: {e}. Run Stage 4 first.")
                 return
@@ -346,7 +332,6 @@ class ProcessingPipeline:
         if not self.class_shp.exists():
             cmd = (
                 f"otbcli_VectorClassifier -in {self.seg_shp} -out {self.class_shp} "
-                # --- FIX: Quotes removed from self.feat_str ---
                 f"-model {model_file} -feat {self.feat_str} -cfield predicted -confmap true"
             )
             self._run_cmd(cmd, stage, 'Vec class + conf')
@@ -355,6 +340,7 @@ class ProcessingPipeline:
 
     # --- Stage 6: Rasterize Class ---
     def stage_6_rasterize_class(self):
+        self._ensure_directories()
         stage = 6
         if not self.class_shp.exists():
             print(f"ERROR: Classified shapefile {self.class_shp} not found. Run Stage 5 first.")
@@ -370,6 +356,7 @@ class ProcessingPipeline:
 
     # --- Stage 7: Rasterize Confidence ---
     def stage_7_rasterize_confidence(self):
+        self._ensure_directories()
         stage = 7
         if not self.class_shp.exists():
             print(f"ERROR: Classified shapefile {self.class_shp} not found. Run Stage 5 first.")
@@ -385,6 +372,7 @@ class ProcessingPipeline:
 
     # --- Stage 8: Cutline ---
     def stage_8_create_cutline(self):
+        # No specific subfolder needed (saves to processed_raster), but good to be safe
         stage = 8
         if not self.cutline_shp.exists():
             self._raster_to_cutline(self.ras, self.cutline_shp, stage)
@@ -393,6 +381,7 @@ class ProcessingPipeline:
     
     # --- Stage 9: Mask Class ---
     def stage_9_mask_class(self):
+        self._ensure_directories()
         stage = 9
         mask_file = self.aux_dir / 'raster_files' / 'EU_arable_areas_mask_3857.tif'
         if not self.class_tif.exists():
@@ -412,6 +401,7 @@ class ProcessingPipeline:
 
     # --- Stage 10: Mask Confidence ---
     def stage_10_mask_confidence(self):
+        self._ensure_directories()
         stage = 10
         mask_file = self.aux_dir / 'raster_files' / 'EU_arable_areas_mask_3857.tif'
         if not self.conf_tif.exists():
@@ -431,6 +421,7 @@ class ProcessingPipeline:
     
     # --- Stage 11: Metrics ---
     def stage_11_calculate_metrics(self):
+        self._ensure_directories()
         stage = 11
         if not self.metrics_fp.exists():
             print(f"[Stage {stage}/{self.total_stages}] Computing metrics and exporting Excel")
@@ -470,7 +461,6 @@ class ProcessingPipeline:
             labels = sorted(list(set(true_vals + pred_vals)))
             cm = confusion_matrix(true_vals, pred_vals, labels=labels)
             precisions, recalls, f1s, _ = precision_recall_fscore_support(true_vals, pred_vals, labels=labels, average=None, zero_division=0)
-            wp, wr, wf, _ = precision_recall_fscore_support(true_vals, pred_vals, average='weighted', zero_division=0)
             
             total = np.sum(cm)
             oa = np.trace(cm) / total
@@ -552,7 +542,6 @@ def get_params(param_dict):
         if not new_val_str:
             continue # Keep default
         
-        # Try to cast to original type
         try:
             original_type = type(val)
             new_params[key] = original_type(new_val_str)
@@ -564,9 +553,8 @@ def get_params(param_dict):
         print(f"  {key}: {val}")
     return new_params
 
-# --- REPLACED get_classifier_params (ANN Removed) ---
 def get_classifier_params(param_dict):
-    """Special helper for classifier params (UPDATED with validation)."""
+    """Special helper for classifier params."""
     new_params = param_dict.copy()
     print("--- Current Parameters ---")
     for key, val in new_params.items():
@@ -575,11 +563,9 @@ def get_classifier_params(param_dict):
     if input("Change parameters? (y/n) [n]: ").lower() != 'y':
         return new_params
 
-    # 1. Choose classifier
     clf = input(f"Enter classifier (e.g., rf, svm) [{new_params['classifier']}]: ") or new_params['classifier']
     new_params['classifier'] = clf.lower()
 
-    # 2. Update params for that classifier
     print(f"\n--- Setting parameters for {clf.upper()} ---")
     if clf == 'rf':
         prefix = 'rf_'
@@ -593,36 +579,29 @@ def get_classifier_params(param_dict):
         for key in [k for k in new_params if k.startswith(prefix)]:
             val = new_params[key]
             
-            # --- VALIDATION LOGIC ---
-            while True: # Start a loop to force valid input
+            while True: 
                 new_val_str = ""
                 
                 if key == 'svm_k':
                     options = ['linear', 'rbf', 'poly', 'sigmoid']
                     print(f"Options: {options}")
                     new_val_str = input(f"Enter new value for '{key}' [{val}]: ")
-                    
-                    if not new_val_str: new_val_str = str(val) # Use default if empty
-                    
+                    if not new_val_str: new_val_str = str(val) 
                     if new_val_str in options:
                         new_params[key] = new_val_str
-                        break # Valid input, exit loop
+                        break 
                     else:
                         print(f"ERROR: Invalid choice. Must be one of {options}.")
-                
                 else:
-                    # Default behavior for other params (like rf_max, svm_c)
                     new_val_str = input(f"Enter new value for '{key}' [{val}]: ")
                     if not new_val_str:
-                        break # Keep default, exit loop
-                    
+                        break 
                     try:
                         original_type = type(val)
                         new_params[key] = original_type(new_val_str)
-                        break # Valid type, exit loop
+                        break 
                     except ValueError:
                         print(f"Invalid value. Must be of type {original_type.__name__}.")
-            # --- End new logic ---
 
     print("--- Updated Parameters ---")
     for key, val in new_params.items():
@@ -677,11 +656,8 @@ def main_menu(pipeline):
                 print("\n--- STAGE 3: SELECTION ---")
                 pipeline.stage_3_selection()
             
-            # --- MODIFIED '4' BLOCK ---
             elif choice == '4':
                 print("\n--- STAGE 4: TRAIN CLASSIFIER ---")
-                
-                # Check if params were changed to force retraining
                 original_params = pipeline.stage4_params.copy()
                 new_params = get_classifier_params(original_params)
                 
@@ -690,13 +666,9 @@ def main_menu(pipeline):
                     print("\nParameters changed, forcing model retrain.")
                     
                 pipeline.stage4_params.update(new_params)
-                
-                # Pass params and the 'force' flag to the function
                 call_params = pipeline.stage4_params.copy()
                 call_params['force_retrain'] = force
-                
                 pipeline.stage_4_train_classifier(**call_params)
-            # --- END MODIFIED BLOCK ---
             
             elif choice == '5':
                 print("\n--- STAGE 5: CLASSIFY VECTOR ---")
@@ -737,7 +709,6 @@ def main_menu(pipeline):
                 print("\n--- STAGE 3: SELECTION ---")
                 pipeline.stage_3_selection()
                 print("\n--- STAGE 4: TRAIN CLASSIFIER ---")
-                # 'Run All' will default to force_retrain=False, which is correct
                 pipeline.stage_4_train_classifier(**pipeline.stage4_params) 
                 print("\n--- STAGE 5: CLASSIFY VECTOR ---")
                 pipeline.stage_5_classify_vector()
@@ -775,9 +746,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     
     try:
-        # Initialize the pipeline class
         pipeline = ProcessingPipeline(track=args.track)
-        # Run the interactive menu
         main_menu(pipeline)
     except Exception as e:
         print(f"\n---!!! A FATAL ERROR OCCURRED ON INITIALIZATION !!!---")
