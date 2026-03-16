@@ -151,10 +151,12 @@ def main():
     mem_ds = drv_mem.Create('', cols, rows, 1, gdal.GDT_Int32)
     mem_band = mem_ds.GetRasterBand(1)
     mem_band.WriteArray(final)
+    # EXPLICITLY SET NODATA so background (0) does not merge with small crops
+    mem_band.SetNoDataValue(0)
 
     # Using threshold of 50 pixels (approx field size depending on resolution)
-    # 4-connectedness
-    gdal.SieveFilter(mem_band, None, mem_band, 50, 4, callback=None)
+    # 8-connectedness is generally preferred for diagonals
+    gdal.SieveFilter(mem_band, None, mem_band, 50, 8, callback=None)
     final = mem_band.ReadAsArray()
     mem_ds = None
     print("Sieve Filter complete.")
@@ -189,7 +191,11 @@ def main():
                 true_vals.append(t)
                 pred_vals.append(p)
 
-    labels = sorted(set(true_vals + pred_vals))
+    # Guarantee all classes from control set are represented in the matrix, even if completely missed
+    all_control_classes = set(ctrl['crop_id'].unique().astype(int))
+    all_control_classes.discard(0)
+    labels = sorted(list(all_control_classes.union(set(pred_vals))))
+
     cm     = confusion_matrix(true_vals, pred_vals, labels=labels)
     prec, rec, f1, _ = precision_recall_fscore_support(
         true_vals, pred_vals,

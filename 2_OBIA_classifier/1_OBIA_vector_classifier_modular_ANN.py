@@ -11,6 +11,7 @@ from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils import resample
+from sklearn.model_selection import train_test_split
 import joblib
 import openpyxl
 from openpyxl.styles import Font
@@ -234,6 +235,9 @@ class ProcessingPipeline:
 
     def _clip_and_mask(self, input_tif, mask_tif, cutline_shp, out_tif, stage):
         print(f"[Stage {stage}/{self.total_stages}] Clipping and Masking...")
+
+        # Step 1: Warp input_tif using cutline_shp
+        tmp_clip = out_tif.with_name(out_tif.stem + "_temp_clip.tif")
         warp_opts = gdal.WarpOptions(
             format='GTiff',
             cutlineDSName=str(cutline_shp),
@@ -241,7 +245,68 @@ class ProcessingPipeline:
             dstNodata=0,
             creationOptions=['COMPRESS=DEFLATE', 'TILED=YES', 'BIGTIFF=YES']
         )
-        gdal.Warp(str(out_tif), str(input_tif), options=warp_opts)
+        ds_clip = gdal.Warp(str(tmp_clip), str(input_tif), options=warp_opts)
+
+        if not ds_clip:
+            raise RuntimeError(f"Failed to clip {input_tif} with {cutline_shp}")
+
+        proj = ds_clip.GetProjection()
+        gt = ds_clip.GetGeoTransform()
+        cols = ds_clip.RasterXSize
+        rows = ds_clip.RasterYSize
+        nbands = ds_clip.RasterCount
+        dt = ds_clip.GetRasterBand(1).DataType
+
+        # Step 2: Warp binary mask_tif to match the exact extent/resolution of tmp_clip
+        tmp_mask = out_tif.with_name(out_tif.stem + "_temp_mask.tif")
+        mask_opts = gdal.WarpOptions(
+            format='GTiff',
+            width=cols, height=rows,
+            outputBounds=(gt[0], gt[3] + rows * gt[5], gt[0] + cols * gt[1], gt[3]),
+            dstSRS=proj,
+            resampleAlg=gdal.GRA_NearestNeighbour,
+            dstNodata=0
+        )
+        ds_mask = gdal.Warp(str(tmp_mask), str(mask_tif), options=mask_opts)
+
+        if not ds_mask:
+            ds_clip = None
+            if tmp_clip.exists(): tmp_clip.unlink()
+            raise RuntimeError(f"Failed to align binary mask {mask_tif}")
+
+        # Step 3: Multiply arrays block-by-block for all bands
+        driver = gdal.GetDriverByName('GTiff')
+        ds_out = driver.Create(str(out_tif), cols, rows, nbands, dt, options=['COMPRESS=DEFLATE', 'TILED=YES', 'BIGTIFF=YES'])
+        ds_out.SetGeoTransform(gt)
+        ds_out.SetProjection(proj)
+
+        for b in range(1, nbands + 1):
+            ds_out.GetRasterBand(b).SetNoDataValue(0)
+
+        band_mask = ds_mask.GetRasterBand(1)
+
+        tile_size = 4096
+        for y in range(0, rows, tile_size):
+            for x in range(0, cols, tile_size):
+                xsize = min(tile_size, cols - x)
+                ysize = min(tile_size, rows - y)
+
+                arr_mask = band_mask.ReadAsArray(x, y, xsize, ysize)
+
+                # Apply mask to each band independently
+                for b in range(1, nbands + 1):
+                    band_clip = ds_clip.GetRasterBand(b)
+                    arr_clip = band_clip.ReadAsArray(x, y, xsize, ysize)
+                    arr_masked = np.where(arr_mask > 0, arr_clip, 0)
+                    ds_out.GetRasterBand(b).WriteArray(arr_masked, x, y)
+
+        ds_out.FlushCache()
+
+        # Cleanup
+        ds_clip = ds_mask = ds_out = None
+        if tmp_clip.exists(): tmp_clip.unlink()
+        if tmp_mask.exists(): tmp_mask.unlink()
+
         print(f"Completed stage {stage}\n")
 
     # --- Stage 1: OTB Segmentation (Direct Raster Pipeline) ---
@@ -398,7 +463,6 @@ class ProcessingPipeline:
 
     # --- Stage 2: Sample Split ---
     def stage_2_split_samples(self, **kwargs):
-        # Same as before
         self._ensure_directories()
         params = self.stage2_params.copy()
         params.update(kwargs)
@@ -409,8 +473,26 @@ class ProcessingPipeline:
             return
 
         gdf = gpd.read_file(str(self.sample_shp))
-        learn = gdf.sample(frac=params['learn_frac'], random_state=params['random_state'])
-        control = gdf.drop(learn.index)
+
+        # Try to use stratify to guarantee all classes are proportionally represented.
+        # Fall back to random sampling if a class has only 1 sample, which throws a ValueError.
+        try:
+            train_idx, test_idx = train_test_split(
+                gdf.index,
+                train_size=params['learn_frac'],
+                random_state=params['random_state'],
+                stratify=gdf['crop_id']
+            )
+        except ValueError as e:
+            print(f"WARNING: Stratified sampling failed (likely due to a class with only 1 sample). Falling back to random sampling. Error: {e}")
+            train_idx, test_idx = train_test_split(
+                gdf.index,
+                train_size=params['learn_frac'],
+                random_state=params['random_state']
+            )
+
+        learn = gdf.loc[train_idx]
+        control = gdf.loc[test_idx]
 
         learn.to_file(str(self.learn_shp))
         control.to_file(str(self.control_shp))
@@ -673,16 +755,17 @@ class ProcessingPipeline:
 
                 unique_ids = np.unique(valid_seg)
                 max_id = unique_ids.max()
-
-                counts = np.bincount(valid_seg, minlength=max_id + 1)
                 
+                counts = np.bincount(valid_seg, minlength=max_id + 1)
+
                 prop_dict = {'label': unique_ids}
                 for b in range(nbands):
                     flat_band = img_list[b].ravel()
                     valid_band = flat_band[valid_mask]
 
                     sums = np.bincount(valid_seg, weights=valid_band, minlength=max_id + 1)
-                    sq_sums = np.bincount(valid_seg, weights=valid_band ** 2, minlength=max_id + 1)
+                    # Convert to float64 before squaring to prevent integer overflow on large scaled int values
+                    sq_sums = np.bincount(valid_seg, weights=valid_band.astype(np.float64) ** 2, minlength=max_id + 1)
 
                     mean_vals = sums[unique_ids] / counts[unique_ids]
                     variance_vals = (sq_sums[unique_ids] / counts[unique_ids]) - (mean_vals ** 2)
@@ -690,9 +773,9 @@ class ProcessingPipeline:
 
                     prop_dict[f'meanB{b}'] = mean_vals
                     prop_dict[f'stdB{b}'] = std_vals
-                
+
                 df_props = pd.DataFrame(prop_dict)
-                
+
                 # Filter features based on what the model was trained on
                 present_cols = [c for c in feat_cols if c in df_props.columns]
                 X_tile = df_props[present_cols].values
@@ -802,7 +885,11 @@ class ProcessingPipeline:
                 print("ERROR: No valid matching true/predicted values found.")
                 return
 
-            labels = sorted(list(set(true_vals + pred_vals)))
+            # Guarantee all classes from control set are represented in the matrix, even if completely missed
+            all_control_classes = set(ctrl['crop_id'].unique().astype(int))
+            all_control_classes.discard(0)
+            labels = sorted(list(all_control_classes.union(set(pred_vals))))
+
             cm = confusion_matrix(true_vals, pred_vals, labels=labels)
             precisions, recalls, f1s, _ = precision_recall_fscore_support(
                 true_vals, pred_vals, labels=labels, average=None, zero_division=0
