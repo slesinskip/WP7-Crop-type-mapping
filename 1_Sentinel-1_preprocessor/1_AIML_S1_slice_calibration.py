@@ -12,7 +12,6 @@ from osgeo import ogr
 # ================= CONFIGURATION =================
 # python 1_AIML_S1_slice_calibration.py -s 2024-10-15 -e 2024-11-30 -t P1
 
-# TODO: USER - VERIFY THIS PATH IS CORRECT
 GPT_EXE = r"D:/Program Files/esa-snap/bin/gpt.exe"
 
 # Path to SNAP AuxData
