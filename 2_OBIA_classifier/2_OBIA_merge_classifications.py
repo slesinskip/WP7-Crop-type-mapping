@@ -145,6 +145,20 @@ def main():
     final = np.take_along_axis(class_stack, idx[None,:,:], axis=0)[0]
     final[np.all(np.isneginf(conf_stack), axis=0)] = 0
 
+    # --- apply morphological sieve filter to restore objects -------------
+    print("Applying Sieve Filter to remove slivers and isolated pixels...")
+    drv_mem = gdal.GetDriverByName('MEM')
+    mem_ds = drv_mem.Create('', cols, rows, 1, gdal.GDT_Int32)
+    mem_band = mem_ds.GetRasterBand(1)
+    mem_band.WriteArray(final)
+
+    # Using threshold of 50 pixels (approx field size depending on resolution)
+    # 4-connectedness
+    gdal.SieveFilter(mem_band, None, mem_band, 50, 4, callback=None)
+    final = mem_band.ReadAsArray()
+    mem_ds = None
+    print("Sieve Filter complete.")
+
     # --- save mosaic --------------------------------------------------------
     base_tr, base_country, _, _ = tracks[0]
     out_dir = base_dir / base_tr / 'classification_results'

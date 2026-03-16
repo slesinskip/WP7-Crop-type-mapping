@@ -156,12 +156,12 @@ class ProcessingPipeline:
         }
         self.stage4_params = {
             'classifier': 'ann_sklearn',
-            # Simpler architecture to prevent overfitting on mean values
-            'sk_hidden_sizes': '100', 
+            # Architecture tuned for both mean and standard deviation (texture) features
+            'sk_hidden_sizes': '100,50',
             'sk_activation': 'relu',
             'sk_solver': 'adam',
-            'sk_alpha': 0.0001,
-            'sk_max_iter': 500,
+            'sk_alpha': 0.001,
+            'sk_max_iter': 1000,
             'balance_threshold': 1000 
         }
 
@@ -326,6 +326,9 @@ class ProcessingPipeline:
 
     def _run_python_segmentation_tiled(self, params, stage, method):
         print(f"[Stage {stage}/{self.total_stages}] Running Tiled Python Segmentation ({method})...")
+        print("WARNING: Python segmentation methods are processed in tiles without overlapping margins.")
+        print("This creates straight artificial edges at tile boundaries, which is not optimal for sharp object statistics.")
+        print("For true object boundaries, it is highly recommended to use the 'otb_meanshift' method.")
         
         try:
             ds = gdal.Open(str(self.ras))
@@ -464,8 +467,9 @@ class ProcessingPipeline:
         
         target_ids_set = set(target_segments.keys())
         
-        # Accumulators for true mean calculation
+        # Accumulators for true mean and std calculation
         sums = {tid: np.zeros(nbands, dtype=np.float64) for tid in target_ids_set}
+        sq_sums = {tid: np.zeros(nbands, dtype=np.float64) for tid in target_ids_set}
         counts = {tid: 0 for tid in target_ids_set}
         
         tile_size = 2048
@@ -498,28 +502,37 @@ class ProcessingPipeline:
                     stack_tile.append(arr)
                 stack_tile = np.array(stack_tile) # Shape: (nbands, ysize, xsize)
                 
-                # 4. Accumulate pixel sums
+                # 4. Accumulate pixel sums and squared sums
                 for tid in intersect_ids:
                     mask = (seg_arr == tid)
                     pixel_count = np.sum(mask)
                     counts[tid] += pixel_count
                     
                     for b in range(nbands):
-                        sums[tid][b] += np.sum(stack_tile[b][mask])
+                        band_vals = stack_tile[b][mask]
+                        sums[tid][b] += np.sum(band_vals)
+                        sq_sums[tid][b] += np.sum(band_vals ** 2)
         
         print("\n    Aggregation complete. Formatting features...")
         
         feature_data = {'crop_id': [], 'seg_id': []}
         for b in range(nbands):
             feature_data[f'meanB{b}'] = []
+            feature_data[f'stdB{b}'] = []
             
         for tid in target_ids_set:
             if counts[tid] > 0:
                 feature_data['crop_id'].append(target_segments[tid])
                 feature_data['seg_id'].append(tid)
                 mean_vals = sums[tid] / counts[tid]
+                # Calculate standard deviation using E[X^2] - (E[X])^2
+                variance_vals = (sq_sums[tid] / counts[tid]) - (mean_vals ** 2)
+                # Ensure variance is non-negative before sqrt (can happen due to float precision)
+                std_vals = np.sqrt(np.maximum(0, variance_vals))
+
                 for b in range(nbands):
                     feature_data[f'meanB{b}'].append(mean_vals[b])
+                    feature_data[f'stdB{b}'].append(std_vals[b])
                     
         df_final = pd.DataFrame(feature_data)
         df_final.to_csv(self.sel_csv, index=False)
@@ -541,7 +554,7 @@ class ProcessingPipeline:
         print(f"[Stage {stage}/{self.total_stages}] Training ANN...")
         
         df = pd.read_csv(self.sel_csv)
-        feat_cols = [c for c in df.columns if c.startswith('meanB')]
+        feat_cols = [c for c in df.columns if c.startswith('meanB') or c.startswith('stdB')]
         self.feat_cols = feat_cols
         
         print("    Balancing classes (Capped Oversampling)...")
@@ -651,32 +664,50 @@ class ProcessingPipeline:
                     img_list.append(arr)
                 img = np.dstack(img_list)
                 
-                props = regionprops_table(seg_arr, intensity_image=img, properties=('label', 'mean_intensity'))
-                df_props = pd.DataFrame(props)
+                # Optimized manual feature calculation to support both mean and std
+                flat_seg = seg_arr.ravel()
+                valid_mask = flat_seg > 0
+                valid_seg = flat_seg[valid_mask]
+
+                if len(valid_seg) == 0: continue
+
+                unique_ids = np.unique(valid_seg)
+                max_id = unique_ids.max()
+
+                counts = np.bincount(valid_seg, minlength=max_id + 1)
                 
-                if df_props.empty: continue
+                prop_dict = {'label': unique_ids}
+                for b in range(nbands):
+                    flat_band = img_list[b].ravel()
+                    valid_band = flat_band[valid_mask]
+
+                    sums = np.bincount(valid_seg, weights=valid_band, minlength=max_id + 1)
+                    sq_sums = np.bincount(valid_seg, weights=valid_band ** 2, minlength=max_id + 1)
+
+                    mean_vals = sums[unique_ids] / counts[unique_ids]
+                    variance_vals = (sq_sums[unique_ids] / counts[unique_ids]) - (mean_vals ** 2)
+                    std_vals = np.sqrt(np.maximum(0, variance_vals))
+
+                    prop_dict[f'meanB{b}'] = mean_vals
+                    prop_dict[f'stdB{b}'] = std_vals
                 
-                rename_map = {f'mean_intensity-{i}': f'meanB{i}' for i in range(nbands)}
-                if nbands == 1 and 'mean_intensity' in df_props.columns:
-                    rename_map = {'mean_intensity': 'meanB0'}
-                df_props.rename(columns=rename_map, inplace=True)
+                df_props = pd.DataFrame(prop_dict)
                 
-                X_tile = df_props[feat_cols].values
+                # Filter features based on what the model was trained on
+                present_cols = [c for c in feat_cols if c in df_props.columns]
+                X_tile = df_props[present_cols].values
                 X_scaled = scaler.transform(X_tile)
                 preds = clf.predict(X_scaled)
                 probs = np.max(clf.predict_proba(X_scaled), axis=1)
                 
-                unique_ids = df_props['label'].values
-                flat_seg = seg_arr.ravel()
-                mask = flat_seg > 0
-                valid_seg = flat_seg[mask]
+                # unique_ids and valid_seg are already calculated above
                 idx_map = np.searchsorted(unique_ids, valid_seg)
                 
                 flat_cls = np.zeros_like(flat_seg, dtype=np.int32)
                 flat_conf = np.zeros_like(flat_seg, dtype=np.float32)
                 
-                flat_cls[mask] = preds[idx_map]
-                flat_conf[mask] = probs[idx_map]
+                flat_cls[valid_mask] = preds[idx_map]
+                flat_conf[valid_mask] = probs[idx_map]
                 
                 cls_tile = flat_cls.reshape(ysize, xsize)
                 conf_tile = flat_conf.reshape(ysize, xsize)
