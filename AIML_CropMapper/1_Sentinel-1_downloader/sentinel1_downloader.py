@@ -99,20 +99,22 @@ class FindSentinel1:
         return feat.GetGeometryRef().ExportToWkt() if feat else ''
 
     def get_products(self, wkt: str) -> list:
-        geom = urllib.parse.quote(wkt, safe='')
         url = (
-            'https://catalogue.dataspace.copernicus.eu/resto/api/collections/Sentinel1/search.json?'
-            f'startDate={self.start_date.isoformat()}T00:00:00Z&'
-            f'completionDate={self.end_date.isoformat()}T23:59:59Z&'
-            'productType=GRD&orbitDirection=ascending&'
-            'maxRecords=100&sortParam=startDate&sortOrder=descending&status=all&'
-            f'geometry={geom}&dataset=ESA-DATASET'
+            'https://catalogue.dataspace.copernicus.eu/odata/v1/Products?$filter='
+            f"OData.CSC.Intersects(area=geography'SRID=4326;{wkt}') "
+            "and Collection/Name eq 'SENTINEL-1' "
+            "and Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'productType' and att/OData.CSC.StringAttribute/Value eq 'GRD') "
+            "and Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'orbitDirection' and att/OData.CSC.StringAttribute/Value eq 'ASCENDING') "
+            f"and ContentDate/Start ge {self.start_date.isoformat()}T00:00:00.000Z "
+            f"and ContentDate/Start le {self.end_date.isoformat()}T23:59:59.999Z"
+            "&$top=100&$orderby=ContentDate/Start desc"
         )
         resp = requests.get(url)
         resp.raise_for_status()
-        features = resp.json().get('features', [])
-        return [{'title': f['properties']['title'], 'url': f['properties']['services']['download']['url'],
-                 'start_date': f['properties']['startDate']} for f in features]
+        features = resp.json().get('value', [])
+        return [{'title': f['Name'],
+                 'url': f"https://catalogue.dataspace.copernicus.eu/odata/v1/Products({f['Id']})/$value",
+                 'start_date': f['ContentDate']['Start']} for f in features]
 
 class CalculateBelts:
     BASE_DATES = {
