@@ -141,8 +141,7 @@ class ProcessingPipeline:
             'tile_size': 4096,
             'ram': 4096,
 
-            # OTB Params (User's original working params for LargeScaleMeanShift vector mode)
-            # Zastosowano ranger 2.0, optymalny dla skompresowanego stosu dB
+            # OTB Params (ranger 2.0 is ideal for a 6-band dB composite, preserving sharp borders)
             'spatialr': 20, 'ranger': 2.0, 'minsize': 200, 'tilesizex': 4096, 'tilesizey': 4096,
 
             # Python Params (Fallback)
@@ -411,18 +410,8 @@ class ProcessingPipeline:
         params.update(kwargs)
         stage = 1
 
-        labelmap_file = self.seg_dir / f"{self.country}_{self.track}_segmentation.shp_labelmap.tif"
-
         if self.seg_tif.exists():
             print(f"[Stage {stage}/{self.total_stages}] Segmentation Raster exists, skipping\n")
-            return
-
-        if labelmap_file.exists():
-            print(f"[Stage {stage}/{self.total_stages}] Found existing OTB Labelmap: {labelmap_file}")
-            print("Using this labelmap to create the final segmentation raster...")
-            gdal.Translate(str(self.seg_tif), str(labelmap_file), format='GTiff',
-                           creationOptions=['COMPRESS=DEFLATE', 'TILED=YES', 'BIGTIFF=YES'])
-            print(f"    Saved as {self.seg_tif}\n")
             return
 
         method = params.get('method', 'otb_meanshift_seasonal')
