@@ -129,7 +129,7 @@ class ProcessingPipeline:
 
         # --- 4. Define default parameters for configurable stages ---
         self.stage1_params = {
-            'spatialr': 20, 'ranger': 10, 'minsize': 200,
+            'spatialr': 25, 'ranger': 6, 'minsize': 200,
             'tilesizex': 4096, 'tilesizey': 4096, 'ram': 4096
         }
         self.stage2_params = {
