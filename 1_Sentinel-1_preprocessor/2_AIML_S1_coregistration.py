@@ -323,7 +323,7 @@ def run_full_processing(selected_tracks, overwrite=False):
 
         # --- STAGE 1: WRAPPING ---
         run_wrap = True
-        if wrapped_file.exists():
+        if wrapped_file.exists() and wrapped_file.with_suffix('.data').is_dir():
             if overwrite:
                 logging.info("Overwrite active: Deleting old wrapped file.")
                 try:

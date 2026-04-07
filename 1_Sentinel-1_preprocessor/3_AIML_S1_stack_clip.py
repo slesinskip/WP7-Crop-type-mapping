@@ -35,6 +35,7 @@ def make_progress(label):
         sys.stdout.write(f"\r    {label} progress: {percent}%")
         sys.stdout.flush()
         return 1
+
     return callback
 
 
@@ -54,6 +55,7 @@ def extract_band_date(stem: str) -> datetime:
     except ValueError:
         return datetime.min
 
+
 def reproject_shapefile(src_shp, dst_shp, target_epsg=3857, force_src_epsg=None):
     """Reprojects a shapefile to the target EPSG code."""
     driver = ogr.GetDriverByName('ESRI Shapefile')
@@ -61,9 +63,9 @@ def reproject_shapefile(src_shp, dst_shp, target_epsg=3857, force_src_epsg=None)
     if not src_ds:
         print(f"Failed to open shapefile: {src_shp}")
         return False
-        
+
     src_layer = src_ds.GetLayer()
-    
+
     # Determine Source SRS
     if force_src_epsg:
         src_srs = osr.SpatialReference()
@@ -71,34 +73,35 @@ def reproject_shapefile(src_shp, dst_shp, target_epsg=3857, force_src_epsg=None)
         print(f"    [Override] Forcing source SRS to EPSG:{force_src_epsg}")
     else:
         src_srs = src_layer.GetSpatialRef()
-    
+
     dst_srs = osr.SpatialReference()
     dst_srs.ImportFromEPSG(target_epsg)
-    
+
     # Create output
     if os.path.exists(str(dst_shp)):
         driver.DeleteDataSource(str(dst_shp))
-        
+
     dst_ds = driver.CreateDataSource(str(dst_shp))
     dst_layer = dst_ds.CreateLayer(src_layer.GetName(), geom_type=src_layer.GetGeomType(), srs=dst_srs)
-    
+
     # Coordinate Transformation
     coord_trans = osr.CoordinateTransformation(src_srs, dst_srs)
-    
+
     # Copy features
     src_layer.ResetReading()
     for feature in src_layer:
         geom = feature.GetGeometryRef()
         geom.Transform(coord_trans)
-        
+
         new_feature = ogr.Feature(dst_layer.GetLayerDefn())
         new_feature.SetGeometry(geom)
         dst_layer.CreateFeature(new_feature)
         new_feature = None
-        
+
     dst_ds = None
     src_ds = None
     return True
+
 
 def stack_and_clip(track: str):
     final_dir = BASE_DIR / track / 'S1_final_preprocessing'
@@ -139,24 +142,24 @@ def stack_and_clip(track: str):
     input_files = [str(p) for p in vh_imgs] + [str(p) for p in vv_imgs]
     vrt_options = gdal.BuildVRTOptions(separate=True)
     ds_vrt = gdal.BuildVRT(str(vrt_file), input_files, options=vrt_options)
-    
+
     for i, img_path in enumerate(vh_imgs):
         band = ds_vrt.GetRasterBand(i + 1)
         desc = STRIP_PATTERN.sub("_", img_path.stem)
         band.SetDescription(desc)
-        
+
     offset = len(vh_imgs)
     for i, img_path in enumerate(vv_imgs):
         band = ds_vrt.GetRasterBand(offset + i + 1)
         desc = STRIP_PATTERN.sub("_", img_path.stem)
         band.SetDescription(desc)
-    
+
     # Force Projection to EPSG:3857 if missing
     if not ds_vrt.GetProjection():
         ds_vrt.SetProjection("EPSG:3857")
-    
+
     ds_vrt.FlushCache()
-    ds_vrt = None 
+    ds_vrt = None
     print("    VRT created.")
 
     # --- CLIP FROM VRT ---
@@ -178,16 +181,16 @@ def stack_and_clip(track: str):
         # --- REPROJECT SHAPEFILE ---
         temp_shp = out_dir / f"temp_cutline_{region}.shp"
         print(f"    Reprojecting shapefile to EPSG:3857...")
-        
+
         # FIX: Force source EPSG for Ireland if the .prj is wrong
         force_epsg = 29902 if region == 'IE' else None
-        
+
         if not reproject_shapefile(shp_path, temp_shp, 3857, force_src_epsg=force_epsg):
             print("    Error reprojecting shapefile. Skipping.")
             continue
 
         print(f"    Clipping {track} to {region} (Directly from VRT)...")
-        
+
         warp_opts = gdal.WarpOptions(
             format='GTiff',
             creationOptions=creation_options,
@@ -197,9 +200,9 @@ def stack_and_clip(track: str):
             dstSRS='EPSG:3857',
             callback=make_progress(f"Clipping {region}")
         )
-        
+
         ds_out = gdal.Warp(str(out_file), str(vrt_file), options=warp_opts)
-        
+
         if ds_out:
             ds_out = None
             size_mb = out_file.stat().st_size / (1024 * 1024)
@@ -208,7 +211,7 @@ def stack_and_clip(track: str):
                 print("    WARNING: Output file is suspiciously small. Check projection overlap!")
         else:
             print("\n    Error: GDAL Warp failed.")
-            
+
         # Cleanup temp shapefile
         if temp_shp.exists():
             for ext in ['.shp', '.shx', '.dbf', '.prj', '.cpg']:
@@ -218,6 +221,7 @@ def stack_and_clip(track: str):
     # Cleanup VRT
     if vrt_file.exists():
         vrt_file.unlink()
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -233,6 +237,7 @@ def main():
         if track in sel:
             print(f"\n=== Processing {track} ===")
             stack_and_clip(track)
+
 
 if __name__ == '__main__':
     main()

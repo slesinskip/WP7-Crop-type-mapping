@@ -3,6 +3,7 @@ import argparse
 from pathlib import Path
 import subprocess
 import sys
+import shlex
 import geopandas as gpd
 import numpy as np
 import pandas as pd
@@ -14,7 +15,6 @@ from sklearn.utils import resample
 import joblib
 import openpyxl
 from openpyxl.styles import Font
-import shutil
 
 from concurrent.futures import ThreadPoolExecutor
 import threading
@@ -143,11 +143,11 @@ class ProcessingPipeline:
         self.stage1_params = {
             'method': 'otb_meanshift',
             'tile_size': 4096,
-            'ram': 32768,
+            'ram': 65536,
 
             # OTB Params (User's original working params for LargeScaleMeanShift vector mode)
             # Zastosowano ranger 2.0, optymalny dla stert dB radaru, oraz 1024 tiles do unikania obcietych map
-            'spatialr': 25, 'ranger': 6.0, 'minsize': 100, 'tilesizex': 4096, 'tilesizey': 4096,
+            'spatialr': 20, 'ranger': 6.0, 'minsize': 100, 'tilesizex': 4096, 'tilesizey': 4096,
 
             # Python Params (Fallback)
             'n_segments': 20000, 'compactness': 5.0, 'slic_sigma': 1.0,
@@ -188,7 +188,9 @@ class ProcessingPipeline:
         if ram:
             env["OTB_MAX_RAM_HINT"] = str(ram)
 
-        proc = subprocess.Popen(cmd, shell=True, stdout=sys.stdout, stderr=sys.stderr, env=env)
+        if isinstance(cmd, str):
+            cmd = shlex.split(cmd, posix=os.name != 'nt')
+        proc = subprocess.Popen(cmd, shell=False, stdout=sys.stdout, stderr=sys.stderr, env=env)
         proc.communicate()
         if proc.returncode != 0:
             raise RuntimeError(f"Stage {stage} failed with return code {proc.returncode}: {cmd}")
@@ -282,7 +284,7 @@ class ProcessingPipeline:
                             arr[stack_arr == 0] = nodata
                             arr[np.isnan(stack_arr)] = nodata
                     except Exception as e:
-                        pass  # Ignore if stack band reading fails for some reason
+                        print(f"Warning: Failed to read stack band: {e}")
 
                 # 3. Read and Apply the Arable Mask (if it exists)
                 if ds_mask:
@@ -608,32 +610,11 @@ class ProcessingPipeline:
         rows = ds.RasterYSize
 
         # --- FIX: ALIGN CRS FOR TRAINING SAMPLES ---
-        raster_srs = osr.SpatialReference()
-        raster_srs.ImportFromWkt(raster_proj)
-
-        # Try to extract the EPSG code directly if possible, it's safer for pyproj
-        epsg = raster_srs.GetAttrValue("AUTHORITY", 1)
-
-        if gdf.crs:
-            needs_reproj = False
-            try:
-                if epsg:
-                    if gdf.crs.to_epsg() != int(epsg):
-                        needs_reproj = True
-                        target_crs = f"EPSG:{epsg}"
-                else:
-                    if gdf.crs.to_wkt() != raster_srs.ExportToWkt():
-                        needs_reproj = True
-                        from pyproj import CRS
-                        target_crs = CRS.from_wkt(raster_srs.ExportToWkt())
-            except Exception as e:
-                print(f"    [WARNING] CRS checking encountered an issue: {e}. Will attempt WKT reprojection.")
-                needs_reproj = True
-                from pyproj import CRS
-                target_crs = CRS.from_wkt(raster_srs.ExportToWkt())
-
-            if needs_reproj:
-                print(f"    Warning: Reprojecting samples from {gdf.crs.name} to Match Raster CRS ({target_crs})...")
+        from pyproj import CRS
+        if raster_proj and gdf.crs:
+            target_crs = CRS.from_wkt(raster_proj)
+            if gdf.crs != target_crs:
+                print(f"    Warning: Reprojecting samples from {gdf.crs.name} to Match Raster CRS...")
                 gdf = gdf.to_crs(target_crs)
 
         print(f"    Finding target segments for {len(gdf)} points...")
@@ -643,15 +624,19 @@ class ProcessingPipeline:
 
         target_segments = {}
 
-        for idx, row in gdf.iterrows():
-            px = int(inv_gt[0] + inv_gt[1] * row.geometry.x + inv_gt[2] * row.geometry.y)
-            py = int(inv_gt[3] + inv_gt[4] * row.geometry.x + inv_gt[5] * row.geometry.y)
+        xs = gdf.geometry.x.values
+        ys = gdf.geometry.y.values
 
+        pxs = (inv_gt[0] + inv_gt[1] * xs + inv_gt[2] * ys).astype(int)
+        pys = (inv_gt[3] + inv_gt[4] * xs + inv_gt[5] * ys).astype(int)
+        crop_ids = gdf['crop_id'].values
+
+        for px, py, crop_id in zip(pxs, pys, crop_ids):
             if 0 <= px < cols and 0 <= py < rows:
                 try:
-                    seg_id = seg_band.ReadAsArray(px, py, 1, 1)[0, 0]
+                    seg_id = seg_band.ReadAsArray(int(px), int(py), 1, 1)[0, 0]
                     if seg_id > 0:
-                        target_segments[seg_id] = row['crop_id']
+                        target_segments[seg_id] = crop_id
                 except:
                     pass
 
@@ -686,13 +671,8 @@ class ProcessingPipeline:
                 sys.stdout.write(f"\r      Reading required data from Tile: x={x}, y={y}    ")
                 sys.stdout.flush()
 
-                stack_tile = []
-                for b in range(1, nbands + 1):
-                    band = ds.GetRasterBand(b)
-                    arr = band.ReadAsArray(x, y, xsize, ysize)
-                    arr = np.nan_to_num(arr)
-                    stack_tile.append(arr)
-                stack_tile = np.array(stack_tile)
+                stack_tile = ds.ReadAsArray(x, y, xsize, ysize)
+                stack_tile = np.nan_to_num(stack_tile, copy=False)
 
                 for tid in intersect_ids:
                     mask = (seg_arr == tid)
@@ -705,24 +685,28 @@ class ProcessingPipeline:
 
         print("\n    Aggregation complete. Formatting features...")
 
-        feature_data = {'crop_id': [], 'seg_id': []}
-        for b in range(nbands):
-            feature_data[f'meanB{b}'] = []
-            feature_data[f'stdB{b}'] = []
+        valid_tids = [tid for tid in target_ids_set if counts[tid] > 0]
 
-        for tid in target_ids_set:
-            if counts[tid] > 0:
-                feature_data['crop_id'].append(target_segments[tid])
-                feature_data['seg_id'].append(tid)
-                n = counts[tid]
-                mean_vals = sums[tid] / n
-                var_vals = (sums_sq[tid] / n) - (mean_vals ** 2)
-                # handle numerical precision issues
-                var_vals = np.maximum(var_vals, 0)
-                std_vals = np.sqrt(var_vals)
-                for b in range(nbands):
-                    feature_data[f'meanB{b}'].append(mean_vals[b])
-                    feature_data[f'stdB{b}'].append(std_vals[b])
+        crop_ids = [target_segments[tid] for tid in valid_tids]
+        seg_ids = valid_tids
+
+        if len(valid_tids) > 0:
+            n_vals = np.array([counts[tid] for tid in valid_tids])[:, None]
+            sums_arr = np.array([sums[tid] for tid in valid_tids])
+            sums_sq_arr = np.array([sums_sq[tid] for tid in valid_tids])
+
+            mean_matrix = sums_arr / n_vals
+            var_matrix = (sums_sq_arr / n_vals) - (mean_matrix ** 2)
+            var_matrix = np.maximum(var_matrix, 0)
+            std_matrix = np.sqrt(var_matrix)
+        else:
+            mean_matrix = np.empty((0, nbands))
+            std_matrix = np.empty((0, nbands))
+
+        feature_data = {'crop_id': crop_ids, 'seg_id': seg_ids}
+        for b in range(nbands):
+            feature_data[f'meanB{b}'] = mean_matrix[:, b]
+            feature_data[f'stdB{b}'] = std_matrix[:, b]
 
         df_final = pd.DataFrame(feature_data)
         df_final.to_csv(self.sel_csv, index=False)
@@ -997,12 +981,17 @@ class ProcessingPipeline:
             inv = gdal.InvGeoTransform(gt)
             true_vals, pred_vals = [], []
 
-            for _, row in ctrl.iterrows():
+            xs = ctrl.geometry.x.values
+            ys = ctrl.geometry.y.values
+
+            pxs = (inv[0] + inv[1] * xs + inv[2] * ys).astype(int)
+            pys = (inv[3] + inv[4] * xs + inv[5] * ys).astype(int)
+            crop_ids = ctrl['crop_id'].values
+
+            for px, py, crop_id in zip(pxs, pys, crop_ids):
                 try:
-                    px = int(inv[0] + inv[1] * row.geometry.x + inv[2] * row.geometry.y)
-                    py = int(inv[3] + inv[4] * row.geometry.x + inv[5] * row.geometry.y)
                     if 0 <= px < ds.RasterXSize and 0 <= py < ds.RasterYSize:
-                        t = int(row['crop_id'])
+                        t = int(crop_id)
                         val_arr = band.ReadAsArray(px, py, 1, 1)
                         if val_arr is not None:
                             p = int(val_arr[0, 0])
@@ -1010,7 +999,7 @@ class ProcessingPipeline:
                                 true_vals.append(t)
                                 pred_vals.append(p)
                 except Exception as e:
-                    pass
+                    print(f"    [WARNING] Failed to extract point value: {e}")
 
             if not true_vals or not pred_vals:
                 print("ERROR: No valid matching true/predicted values found.")

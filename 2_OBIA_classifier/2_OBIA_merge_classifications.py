@@ -180,17 +180,23 @@ def main():
     ctrl     = gpd.read_file(str(ctrl_shp))
     inv      = gdal.InvGeoTransform(gt_global)
 
-    true_vals, pred_vals = [], []
-    for _, row in ctrl.iterrows():
-        px = int(inv[0] + inv[1]*row.geometry.x + inv[2]*row.geometry.y)
-        py = int(inv[3] + inv[4]*row.geometry.x + inv[5]*row.geometry.y)
-        if 0 <= px < cols and 0 <= py < rows:
-            t = int(row['crop_id'])
-            p = int(final[py, px])
-            if t > 0 and p > 0:
-                true_vals.append(t)
-                pred_vals.append(p)
+    x_coords = ctrl.geometry.x.values
+    y_coords = ctrl.geometry.y.values
+    crop_ids = ctrl['crop_id'].values
 
+    px_vals = (inv[0] + inv[1]*x_coords + inv[2]*y_coords).astype(int)
+    py_vals = (inv[3] + inv[4]*x_coords + inv[5]*y_coords).astype(int)
+
+    valid_mask = (px_vals >= 0) & (px_vals < cols) & (py_vals >= 0) & (py_vals < rows)
+
+    valid_px = px_vals[valid_mask]
+    valid_py = py_vals[valid_mask]
+    valid_crop_ids = crop_ids[valid_mask].astype(int)
+    valid_preds = final[valid_py, valid_px].astype(int)
+    final_mask = (valid_crop_ids > 0) & (valid_preds > 0)
+
+    true_vals = valid_crop_ids[final_mask].tolist()
+    pred_vals = valid_preds[final_mask].tolist()
     # Guarantee all classes from control set are represented in the matrix, even if completely missed
     all_control_classes = set(ctrl['crop_id'].unique().astype(int))
     all_control_classes.discard(0)

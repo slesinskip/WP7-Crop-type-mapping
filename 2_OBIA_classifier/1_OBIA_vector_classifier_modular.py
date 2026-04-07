@@ -3,6 +3,7 @@ import argparse
 from pathlib import Path
 import subprocess
 import sys
+import shlex
 import geopandas as gpd
 import numpy as np
 import pandas as pd
@@ -109,6 +110,33 @@ class ProcessingPipeline:
                 print(f"Training samples found at: {self.sample_shp}")
                 break
 
+        # 2. If not found, do a recursive 'smart search' in samples_base
+        if not self.sample_shp and samples_base.exists():
+            print(f"Exact path matches not found. Performing smart search in {samples_base}...")
+            # Find all samples.shp files
+            all_samples = list(samples_base.rglob("samples.shp"))
+
+            if all_samples:
+                # Try to find a path that contains the track name
+                for p in all_samples:
+                    if self.track in p.parts:
+                        self.sample_shp = p
+                        print(f"Training samples found via smart search (matched track): {self.sample_shp}")
+                        break
+
+                # If still not found, try to find a path that contains the country name
+                if not self.sample_shp:
+                    for p in all_samples:
+                        if self.country in p.parts:
+                            self.sample_shp = p
+                            print(f"Training samples found via smart search (matched country): {self.sample_shp}")
+                            break
+
+                # If still not found, just pick the first one
+                if not self.sample_shp:
+                    self.sample_shp = all_samples[0]
+                    print(f"Training samples found via smart search (fallback first match): {self.sample_shp}")
+
         if not self.sample_shp:
             print(f"\nCRITICAL WARNING: Could not find 'samples.shp' inside {samples_base}")
             print(f"Checked subfolders: {self.country}_{self.track}, {self.track}, {self.country}")
@@ -170,7 +198,9 @@ class ProcessingPipeline:
         env["GDAL_DATA"] = str(otb_dir / "share" / "gdal")
 
         # Run command
-        proc = subprocess.Popen(cmd, shell=True, stdout=sys.stdout, stderr=sys.stderr, env=env)
+        if isinstance(cmd, str):
+            cmd = shlex.split(cmd, posix=os.name != 'nt')
+        proc = subprocess.Popen(cmd, shell=False, stdout=sys.stdout, stderr=sys.stderr, env=env)
         proc.communicate()
         if proc.returncode != 0:
             raise RuntimeError(f"Stage {stage} failed with return code {proc.returncode}: {cmd}")
@@ -390,11 +420,7 @@ class ProcessingPipeline:
 
             # --- FIX: Use 'predicate' for modern GeoPandas ---
             # Your error "unexpected keyword argument 'op'" means you have a new version.
-            try:
-                sel = gpd.sjoin(polys, pts, how='inner', predicate='intersects')
-            except TypeError:
-                # Fallback for very old versions (just in case)
-                sel = gpd.sjoin(polys, pts, how='inner', op='intersects')
+            sel = gpd.sjoin(polys, pts, how='inner', predicate='intersects')
 
             sel.to_file(self.sel_shp, engine="pyogrio")
             print(f"[Stage {stage}/{self.total_stages}] Selected {len(sel)} features\n")
@@ -598,12 +624,17 @@ class ProcessingPipeline:
             inv = gdal.InvGeoTransform(gt)
             true_vals, pred_vals = [], []
 
-            for _, row in ctrl.iterrows():
+            xs = ctrl.geometry.x.values
+            ys = ctrl.geometry.y.values
+
+            pxs = (inv[0] + inv[1] * xs + inv[2] * ys).astype(int)
+            pys = (inv[3] + inv[4] * xs + inv[5] * ys).astype(int)
+            crop_ids = ctrl['crop_id'].values
+
+            for px, py, crop_id in zip(pxs, pys, crop_ids):
                 try:
-                    px = int(inv[0] + inv[1] * row.geometry.x + inv[2] * row.geometry.y)
-                    py = int(inv[3] + inv[4] * row.geometry.x + inv[5] * row.geometry.y)
                     if 0 <= px < arr.shape[1] and 0 <= py < arr.shape[0]:
-                        t = int(row['crop_id'])
+                        t = int(crop_id)
                         p = int(arr[py, px])
                         if t > 0 and p > 0:
                             true_vals.append(t)

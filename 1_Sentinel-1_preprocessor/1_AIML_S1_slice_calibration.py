@@ -252,20 +252,20 @@ class LocalSentinel1Finder:
                 manifest = safe_path / "manifest.SAFE"
             if not manifest.exists():
                 return None
-            
+
             with open(manifest, 'r', encoding='utf-8') as f:
                 content = f.read()
-                
+
             match = re.search(r':relativeOrbitNumber\s+type="start">(\d+)<', content)
             if match:
                 return int(match.group(1))
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"Failed to parse relative orbit for {safe_path.name}: {e}")
         return None
 
     def find_products(self, track_name: str, start_date: datetime.date, end_date: datetime.date,
                       working_dir: pathlib.Path = None):
-        
+
         target_orbit = TRACK_ORBITS.get(track_name)
         base_date = BASE_DATES.get(track_name)
         geo_key = track_name
@@ -284,7 +284,7 @@ class LocalSentinel1Finder:
 
         current_date = start_date
         while current_date <= end_date:
-            
+
             should_scan = False
             if target_orbit is not None:
                 if first_orbit_match_date is None:
@@ -298,16 +298,17 @@ class LocalSentinel1Finder:
                 # Fallback to date cycle for non-orbit tracks
                 if (current_date - base_date).days % 6 == 0:
                     should_scan = True
-            
+
             if should_scan:
                 day_products = []
-                
+
                 # --- CHECK IF FINAL SLICED PRODUCT ALREADY EXISTS ---
                 if working_dir:
                     date_str = current_date.strftime("%Y%m%d")
                     final_output_dir = working_dir / track_name / "slice_assembly"
                     if final_output_dir.exists():
-                        existing_finals = list(final_output_dir.glob(f"{date_str}_{track_name}_*.dim"))
+                        existing_finals = [f for f in final_output_dir.glob(f"{date_str}_{track_name}_*.dim") if
+                                           f.with_suffix('.data').is_dir()]
                         if existing_finals:
                             logging.info(
                                 f"Skipping search for {date_str}: Final output already exists ({existing_finals[0].name})")
@@ -324,20 +325,20 @@ class LocalSentinel1Finder:
                         if target_orbit:
                             scan_msg += f" (Orbit {target_orbit})"
                         logging.info(scan_msg)
-                        
+
                         for safe_dir in day_path.glob("*.SAFE"):
                             # 1. Check Orbit (if defined)
                             if target_orbit:
                                 orbit_num = self._get_relative_orbit(safe_dir)
                                 if orbit_num != target_orbit:
                                     continue
-                            
+
                             # 2. Check Geometry
                             prod_geom = self._get_safe_footprint(safe_dir)
                             if not prod_geom:
                                 logging.warning(f"   [SKIP] Geometry parse failed: {safe_dir.name}")
                                 continue
-                            
+
                             if prod_geom.Intersects(target_geom):
                                 logging.info(f"   -> MATCH: {safe_dir.name}")
                                 day_products.append(safe_dir)
@@ -347,7 +348,8 @@ class LocalSentinel1Finder:
                 if day_products:
                     # If this is an orbit-based track and it's the first find, set the new base date.
                     if target_orbit is not None and first_orbit_match_date is None:
-                        logging.info(f"   First orbit match for {track_name} found on {current_date}. Switching to 6-day scan cycle.")
+                        logging.info(
+                            f"   First orbit match for {track_name} found on {current_date}. Switching to 6-day scan cycle.")
                         first_orbit_match_date = current_date
 
                     yield current_date, day_products
@@ -370,7 +372,7 @@ def run_calibration_stage(track_name, safe_paths, working_dir):
         output_dim = calibrated_dir / f"{stem}_Cal.dim"
 
         # CHECK IF CALIBRATED FILE EXISTS - SKIP IF SO
-        if output_dim.exists():
+        if output_dim.exists() and output_dim.with_suffix('.data').is_dir():
             logging.info(f"Skipping existing calibration: {stem}")
             processed_dims.append(output_dim)
             continue
@@ -414,13 +416,14 @@ def run_calibration_stage(track_name, safe_paths, working_dir):
 
         try:
             subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            
+
             # --- CRITICAL FIX: Verify output exists ---
-            if output_dim.exists():
+            output_data_dir = output_dim.with_suffix('.data')
+            if output_dim.exists() and output_data_dir.is_dir():
                 processed_dims.append(output_dim)
             else:
-                logging.error(f"Calibration FAILED for {stem}. Output file not created: {output_dim}")
-                
+                logging.error(f"Calibration FAILED for {stem}. Output file or data directory not created: {output_dim}")
+
             xml_file.unlink(missing_ok=True)
         except subprocess.CalledProcessError as e:
             logging.error(f"Error calibrating {stem}:\n{e.stderr}")
@@ -435,17 +438,23 @@ def run_slice_assembly_stage(track_name, calibrated_dims, working_dir):
 
     groups = defaultdict(list)
     for dim_path in calibrated_dims:
+        # --- VALIDATE DIM/DATA PAIR ---
+        data_dir = dim_path.with_suffix(".data")
+        if not dim_path.exists() or not data_dir.exists():
+            logging.warning(f"Incomplete BEAM-DIMAP product skipped: {dim_path.name} (Missing .data folder)")
+            continue
+
         try:
             parts = dim_path.stem.split('_')
             date_str = next((p[:8] for p in parts if len(p) >= 8 and p[:8].isdigit()), "00000000")
             groups[date_str].append(dim_path)
-        except Exception:
-            logging.warning(f"Could not parse date from {dim_path.name}")
+        except Exception as e:
+            logging.warning(f"Could not parse date from {dim_path.name}: {e}")
 
     for date_str, files in groups.items():
         if date_str == "00000000":
             continue
-        
+
         # --- FIX: Ensure we have files to process ---
         if not files:
             logging.warning(f"[{track_name}] No valid calibrated files for {date_str}. Skipping.")
@@ -456,7 +465,7 @@ def run_slice_assembly_stage(track_name, calibrated_dims, working_dir):
         out_dim = slice_folder / f"{date_str}_{track_name}_IW_GRDH_{sensor}.dim"
 
         # CHECK IF FINAL SLICE EXISTS - SKIP IF SO
-        if out_dim.exists():
+        if out_dim.exists() and out_dim.with_suffix('.data').is_dir():
             logging.info(f"[{track_name}] Slice {date_str} exists, skipping.")
             continue
 
@@ -563,7 +572,7 @@ def main():
         sys.exit(1)
 
     finder = LocalSentinel1Finder(repo)
-    
+
     # Combine keys from both configs
     all_tracks = set(BASE_DATES.keys()) | set(TRACK_ORBITS.keys())
     tracks_to_process = args.track or list(all_tracks)

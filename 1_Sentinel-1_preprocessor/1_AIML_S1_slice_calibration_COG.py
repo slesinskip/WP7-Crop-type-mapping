@@ -307,7 +307,7 @@ class LocalSentinel1Finder:
                     date_str = current_date.strftime("%Y%m%d")
                     final_output_dir = working_dir / track_name / "slice_assembly"
                     if final_output_dir.exists():
-                        existing_finals = list(final_output_dir.glob(f"{date_str}_{track_name}_*.dim"))
+                        existing_finals = [f for f in final_output_dir.glob(f"{date_str}_{track_name}_*.dim") if f.with_suffix('.data').is_dir()]
                         if existing_finals:
                             logging.info(
                                 f"Skipping search for {date_str}: Final output already exists ({existing_finals[0].name})")
@@ -370,7 +370,7 @@ def run_calibration_stage(track_name, safe_paths, working_dir):
         output_dim = calibrated_dir / f"{stem}_Cal.dim"
 
         # CHECK IF CALIBRATED FILE EXISTS - SKIP IF SO
-        if output_dim.exists():
+        if output_dim.exists() and output_dim.with_suffix('.data').is_dir():
             logging.info(f"Skipping existing calibration: {stem}")
             processed_dims.append(output_dim)
             continue
@@ -416,10 +416,11 @@ def run_calibration_stage(track_name, safe_paths, working_dir):
             subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
             # --- CRITICAL FIX: Verify output exists ---
-            if output_dim.exists():
+            output_data_dir = output_dim.with_suffix('.data')
+            if output_dim.exists() and output_data_dir.is_dir():
                 processed_dims.append(output_dim)
             else:
-                logging.error(f"Calibration FAILED for {stem}. Output file not created: {output_dim}")
+                logging.error(f"Calibration FAILED for {stem}. Output file or data directory not created: {output_dim}")
 
             xml_file.unlink(missing_ok=True)
         except subprocess.CalledProcessError as e:
@@ -435,6 +436,12 @@ def run_slice_assembly_stage(track_name, calibrated_dims, working_dir):
 
     groups = defaultdict(list)
     for dim_path in calibrated_dims:
+        # --- VALIDATE DIM/DATA PAIR ---
+        data_dir = dim_path.with_suffix(".data")
+        if not dim_path.exists() or not data_dir.exists():
+            logging.warning(f"Incomplete BEAM-DIMAP product skipped: {dim_path.name} (Missing .data folder)")
+            continue
+
         try:
             parts = dim_path.stem.split('_')
             date_str = next((p[:8] for p in parts if len(p) >= 8 and p[:8].isdigit()), "00000000")
@@ -447,6 +454,16 @@ def run_slice_assembly_stage(track_name, calibrated_dims, working_dir):
             continue
 
         # --- FIX: Ensure we have files to process ---
+        valid_files = []
+        for f in files:
+            data_dir = f.with_suffix('.data')
+            if f.exists() and data_dir.exists() and data_dir.is_dir():
+                valid_files.append(f)
+            else:
+                logging.warning(f"[{track_name}] Incomplete BEAM-DIMAP product skipped: {f.name}")
+
+        files = valid_files
+
         if not files:
             logging.warning(f"[{track_name}] No valid calibrated files for {date_str}. Skipping.")
             continue
@@ -456,7 +473,7 @@ def run_slice_assembly_stage(track_name, calibrated_dims, working_dir):
         out_dim = slice_folder / f"{date_str}_{track_name}_IW_GRDH_{sensor}.dim"
 
         # CHECK IF FINAL SLICE EXISTS - SKIP IF SO
-        if out_dim.exists():
+        if out_dim.exists() and out_dim.with_suffix('.data').is_dir():
             logging.info(f"[{track_name}] Slice {date_str} exists, skipping.")
             continue
 
