@@ -3,6 +3,7 @@ import argparse
 from pathlib import Path
 import subprocess
 import sys
+import shutil
 import shlex
 import geopandas as gpd
 import numpy as np
@@ -147,7 +148,7 @@ class ProcessingPipeline:
 
             # OTB Params (User's original working params for LargeScaleMeanShift vector mode)
             # Zastosowano ranger 2.0, optymalny dla stert dB radaru, oraz 1024 tiles do unikania obcietych map
-            'spatialr': 20, 'ranger': 6.0, 'minsize': 100, 'tilesizex': 4096, 'tilesizey': 4096,
+            'spatialr': 15, 'ranger': 3.0, 'minsize': 100, 'tilesizex': 4096, 'tilesizey': 4096,
 
             # Python Params (Fallback)
             'n_segments': 20000, 'compactness': 5.0, 'slic_sigma': 1.0,
@@ -190,6 +191,12 @@ class ProcessingPipeline:
 
         if isinstance(cmd, str):
             cmd = shlex.split(cmd, posix=os.name != 'nt')
+
+        # Resolve full path to executable, crucial for Windows .bat execution without shell=True
+        executable = shutil.which(cmd[0], path=env.get("PATH"))
+        if executable:
+            cmd[0] = executable
+
         proc = subprocess.Popen(cmd, shell=False, stdout=sys.stdout, stderr=sys.stderr, env=env)
         proc.communicate()
         if proc.returncode != 0:

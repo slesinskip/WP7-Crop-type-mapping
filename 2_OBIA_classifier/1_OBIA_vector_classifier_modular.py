@@ -3,6 +3,7 @@ import argparse
 from pathlib import Path
 import subprocess
 import sys
+import shutil
 import shlex
 import geopandas as gpd
 import numpy as np
@@ -200,6 +201,12 @@ class ProcessingPipeline:
         # Run command
         if isinstance(cmd, str):
             cmd = shlex.split(cmd, posix=os.name != 'nt')
+
+        # Resolve full path to executable, crucial for Windows .bat execution without shell=True
+        executable = shutil.which(cmd[0], path=env.get("PATH"))
+        if executable:
+            cmd[0] = executable
+
         proc = subprocess.Popen(cmd, shell=False, stdout=sys.stdout, stderr=sys.stderr, env=env)
         proc.communicate()
         if proc.returncode != 0:
