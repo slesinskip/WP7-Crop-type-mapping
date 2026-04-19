@@ -22,9 +22,12 @@ import threading
 
 # Try importing scikit-image
 try:
-    from skimage.segmentation import felzenszwalb, slic
+    from skimage.segmentation import felzenszwalb, slic, watershed
+    from skimage.filters import sobel
+    from skimage.graph import rag_mean_color, merge_hierarchical
     from skimage.util import img_as_float
     from skimage.measure import regionprops_table
+    import scipy.ndimage as ndi
 
     HAS_SKIMAGE = True
 except ImportError:
@@ -142,17 +145,13 @@ class ProcessingPipeline:
 
         # --- 4. Parameters ---
         self.stage1_params = {
-            'method': 'otb_meanshift',
+            'method': 'python_mrs_summed',
             'tile_size': 4096,
-            'ram': 65536,
-
-            # OTB Params (User's original working params for LargeScaleMeanShift vector mode)
-            # Zastosowano ranger 2.0, optymalny dla stert dB radaru, oraz 1024 tiles do unikania obcietych map
-            'spatialr': 20, 'ranger': 6.0, 'minsize': 100, 'tilesizex': 4096, 'tilesizey': 4096,
-
-            # Python Params (Fallback)
-            'n_segments': 20000, 'compactness': 5.0, 'slic_sigma': 1.0,
-            'scale': 100, 'sigma': 0.8, 'min_size': 50
+            'buffer': 256,
+            'n_segments': 20000, 
+            'compactness': 0.1, 
+            'ws_compactness': 0.001, 
+            'mrs_thresh': 0.08
         }
         self.stage2_params = {
             'learn_frac': 0.7, 'random_state': 42
@@ -417,6 +416,69 @@ class ProcessingPipeline:
 
         return composite_tif
 
+    def _create_summed_composite(self):
+        """Creates a single-band composite by summing the linear values of all SAR bands to reduce speckle."""
+        print("    [INFO] Creating a summed composite of all SAR bands to reduce speckle...")
+
+        composite_tif = self.seg_dir / f"{self.country}_{self.track}_summed_composite.tif"
+
+        if composite_tif.exists():
+            print(f"    [INFO] Summed composite already exists at {composite_tif}.")
+            return composite_tif
+
+        ds = gdal.Open(str(self.ras))
+        if not ds:
+            raise RuntimeError(f"Could not open source raster {self.ras}")
+
+        cols = ds.RasterXSize
+        rows = ds.RasterYSize
+        nbands = ds.RasterCount
+        gt = ds.GetGeoTransform()
+        proj = ds.GetProjection()
+
+        driver = gdal.GetDriverByName('GTiff')
+        out_ds = driver.Create(str(composite_tif), cols, rows, 1, gdal.GDT_Float32,
+                               options=['COMPRESS=DEFLATE', 'TILED=YES', 'BIGTIFF=YES'])
+        out_ds.SetGeoTransform(gt)
+        out_ds.SetProjection(proj)
+        out_band = out_ds.GetRasterBand(1)
+        out_band.SetNoDataValue(0)
+
+        tile_size = 4096
+        
+        for y in range(0, rows, tile_size):
+            for x in range(0, cols, tile_size):
+                xsize = min(tile_size, cols - x)
+                ysize = min(tile_size, rows - y)
+
+                sum_arr = np.zeros((ysize, xsize), dtype=np.float32)
+                valid_mask = np.zeros((ysize, xsize), dtype=bool)
+
+                for b in range(1, nbands + 1):
+                    band = ds.GetRasterBand(b)
+                    arr = band.ReadAsArray(x, y, xsize, ysize)
+                    nodata = band.GetNoDataValue()
+                    
+                    if nodata is not None:
+                        mask = (arr != nodata) & (~np.isnan(arr)) & (arr != 0)
+                    else:
+                        mask = (~np.isnan(arr)) & (arr != 0)
+                        
+                    sum_arr[mask] += arr[mask]
+                    valid_mask |= mask
+
+                # Set areas where all bands were nodata to 0
+                sum_arr[~valid_mask] = 0
+
+                out_band.WriteArray(sum_arr, x, y)
+
+        out_ds.FlushCache()
+        out_ds = None
+        ds = None
+        print(f"    [INFO] Summed composite saved to {composite_tif}")
+
+        return composite_tif
+
     # --- Stage 1: OTB Segmentation (Direct Raster Pipeline) ---
     def stage_1_segmentation(self, **kwargs):
         self._ensure_directories()
@@ -430,7 +492,7 @@ class ProcessingPipeline:
 
         method = params.get('method', 'otb_meanshift')
 
-        if method in ['otb_meanshift', 'otb_meanshift_seasonal']:
+        if method in ['otb_meanshift', 'otb_meanshift_seasonal', 'otb_meanshift_summed']:
             print(f"[Stage {stage}/{self.total_stages}] Running OTB Large-Scale Mean-Shift (Vector Mode) [{method}]...")
 
             input_raster_for_seg = self.ras
@@ -439,6 +501,12 @@ class ProcessingPipeline:
                     input_raster_for_seg = self._create_seasonal_composite()
                 except Exception as e:
                     print(f"    [WARNING] Failed to create seasonal composite: {e}. Falling back to full stack.")
+                    input_raster_for_seg = self.ras
+            elif method == 'otb_meanshift_summed':
+                try:
+                    input_raster_for_seg = self._create_summed_composite()
+                except Exception as e:
+                    print(f"    [WARNING] Failed to create summed composite: {e}. Falling back to full stack.")
                     input_raster_for_seg = self.ras
 
             if not self.seg_shp.exists():
@@ -493,11 +561,28 @@ class ProcessingPipeline:
 
             return
 
-        if method in ['python_felzenszwalb', 'python_slic']:
+        if method in ['python_felzenszwalb', 'python_slic', 'python_mrs', 'python_mrs_seasonal', 'python_mrs_summed']:
             if not HAS_SKIMAGE:
                 print("Error: scikit-image not installed.")
                 return
-            self._run_python_segmentation_tiled(params, stage, method)
+                
+            original_ras = self.ras
+            if method == 'python_mrs_seasonal':
+                try:
+                    self.ras = self._create_seasonal_composite()
+                except Exception as e:
+                    print(f"    [WARNING] Failed to create seasonal composite: {e}. Falling back to full stack.")
+            elif method == 'python_mrs_summed':
+                try:
+                    self.ras = self._create_summed_composite()
+                except Exception as e:
+                    print(f"    [WARNING] Failed to create summed composite: {e}. Falling back to full stack.")
+            
+            # Use 'python_mrs' logic internally
+            internal_method = 'python_mrs' if method in ['python_mrs_seasonal', 'python_mrs_summed'] else method
+            self._run_python_segmentation_tiled(params, stage, internal_method)
+            
+            self.ras = original_ras
             return
 
         print(f"Error: Unknown segmentation method '{method}'")
@@ -524,19 +609,28 @@ class ProcessingPipeline:
             out_band.SetNoDataValue(0)
 
             tile_size = params.get('tile_size', 4096)
+            buffer = params.get('buffer', 256)
             global_seg_id = 1
 
             for y in range(0, rows, tile_size):
                 for x in range(0, cols, tile_size):
-                    xsize = min(tile_size, cols - x)
-                    ysize = min(tile_size, rows - y)
+                    xsize_valid = min(tile_size, cols - x)
+                    ysize_valid = min(tile_size, rows - y)
 
-                    print(f"    Processing Tile: x={x}, y={y}")
+                    x_start_buf = max(0, x - buffer)
+                    y_start_buf = max(0, y - buffer)
+                    x_end_buf = min(cols, x + xsize_valid + buffer)
+                    y_end_buf = min(rows, y + ysize_valid + buffer)
+
+                    xsize_buf = x_end_buf - x_start_buf
+                    ysize_buf = y_end_buf - y_start_buf
+
+                    print(f"    Processing Tile: x={x}, y={y} (buffered {xsize_buf}x{ysize_buf})")
 
                     img_list = []
                     for b in range(1, nbands + 1):
                         band = ds.GetRasterBand(b)
-                        arr = band.ReadAsArray(x, y, xsize, ysize)
+                        arr = band.ReadAsArray(x_start_buf, y_start_buf, xsize_buf, ysize_buf)
                         arr = np.nan_to_num(arr)
                         img_list.append(arr)
 
@@ -549,18 +643,50 @@ class ProcessingPipeline:
                     img_norm = img_as_float(img)
 
                     if method == 'python_felzenszwalb':
-                        segments = felzenszwalb(img_norm, scale=params['scale'], sigma=params['sigma'],
+                        segments_buf = felzenszwalb(img_norm, scale=params['scale'], sigma=params['sigma'],
                                                 min_size=params['min_size'])
                     elif method == 'python_slic':
-                        segments = slic(img_norm, n_segments=params['n_segments'], compactness=params['compactness'],
+                        segments_buf = slic(img_norm, n_segments=params['n_segments'], compactness=params['compactness'],
                                         sigma=params['slic_sigma'], start_label=1, mask=valid_mask)
+                    elif method == 'python_mrs':
+                        edge_mag = np.zeros(img_norm.shape[:2], dtype=np.float32)
+                        for b in range(img_norm.shape[2]):
+                            edge_mag += sobel(img_norm[:, :, b])
+
+                        markers = slic(img_norm, n_segments=params.get('n_segments', 20000), compactness=params.get('compactness', 0.1), sigma=1)
+                        segments_ws = watershed(edge_mag, markers, mask=valid_mask, compactness=params.get('ws_compactness', 0.001))
+
+                        def weight_mean_color(graph, src, dst, n):
+                            diff = graph.nodes[dst]['mean color'] - graph.nodes[src]['mean color']
+                            return {'weight': np.linalg.norm(diff)}
+
+                        def merge_mean_color(graph, src, dst):
+                            graph.nodes[dst]['total color'] += graph.nodes[src]['total color']
+                            graph.nodes[dst]['pixel count'] += graph.nodes[src]['pixel count']
+                            graph.nodes[dst]['mean color'] = graph.nodes[dst]['total color'] / graph.nodes[dst]['pixel count']
+
+                        rag = rag_mean_color(img_norm, segments_ws)
+                        segments_buf = merge_hierarchical(segments_ws, rag, thresh=params.get('mrs_thresh', 0.08), rag_copy=False,
+                                                          in_place_merge=True, merge_func=merge_mean_color, weight_func=weight_mean_color)
+
+                    y_offset = y - y_start_buf
+                    x_offset = x - x_start_buf
+                    segments = segments_buf[y_offset : y_offset + ysize_valid, x_offset : x_offset + xsize_valid]
+                    valid_mask_crop = valid_mask[y_offset : y_offset + ysize_valid, x_offset : x_offset + xsize_valid]
 
                     seg_valid_mask = segments > 0
-                    segments[seg_valid_mask] += global_seg_id
-                    segments[~valid_mask] = 0
-
-                    if np.any(seg_valid_mask):
-                        global_seg_id = segments.max() + 1
+                    
+                    unique_segs = np.unique(segments[seg_valid_mask])
+                    if len(unique_segs) > 0:
+                        max_seg = segments.max()
+                        mapping = np.zeros(max_seg + 1, dtype=np.int32)
+                        mapping[unique_segs] = np.arange(global_seg_id, global_seg_id + len(unique_segs))
+                        
+                        segments = mapping[segments]
+                        segments[~valid_mask_crop] = 0
+                        global_seg_id += len(unique_segs)
+                    else:
+                        segments[~valid_mask_crop] = 0
 
                     out_band.WriteArray(segments.astype(np.int32), x, y)
 
@@ -1135,7 +1261,7 @@ def main_menu(pipeline):
     --- Raster-Based OBIA Pipeline (ANN) ---
     Track: {pipeline.track} ({pipeline.country})
 
-    [1] Stage 1: OTB Segmentation (Raster Mode)
+    [1] Stage 1: SAR Summed Segmentation (eCognition-style MRS)
     [2] Stage 2: Split Samples
     [3] Stage 3: Extract Features (Object-based Training)
     [4] Stage 4: Train ANN Classifier
